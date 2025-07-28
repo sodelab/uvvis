@@ -3,74 +3,61 @@
 parse_spectra.py
 
 Parse Gaussian log files to extract excitation wavelengths and oscillator strengths,
-compute a broadened spectrum across 0–800 nm, and save results to a CSV.
+compute a broadened spectrum across 0–800 nm, extract optimized geometry (with element symbols), and save results to a CSV.
 
 Usage:
   python parse_spectra.py [--start N] [--end M] [--width W] [--kind {gaussian,lorentzian}] [--csv FILE]
-
-Options:
-  --start N       First molecule index (inclusive). If omitted, all matching logs are scanned.
-  --end M         Last molecule index (inclusive). Only used if --start is provided.
-  --width W       Broadening width in nm (sigma for Gaussian or gamma for Lorentzian). Default: 10.0
-  --kind K        Broadening type: 'gaussian' or 'lorentzian'. Default: 'gaussian'
-  --csv FILE      Output CSV filename. Default: 'spectra.csv'
-
-Each row in the CSV will contain:
-  - molecule: integer index
-  - wavelengths: JSON list of excitation wavelengths (nm)
-  - oscillator_strengths: JSON list of oscillator strengths
-  - width: the broadening width used
-  - kind: broadening type
-  - spectrum: JSON list of normalized intensities at 0–800 nm
-
-Automatically checks only the last 10 lines of a log for "Normal termination" to ensure completion before parsing.
 """
-
 import os
 import re
 import glob
 import json
 import argparse
-
+import warnings
 import numpy as np
 import pandas as pd
 
-# Define the expected DataFrame columns
+# Suppress specific FutureWarning from pandas concat
+warnings.filterwarnings(
+    "ignore",
+    message=".*DataFrame concatenation with empty or all-NA entries is deprecated.*",
+    category=FutureWarning
+)
+
+# Periodic table mapping: atomic number -> symbol (1-36)
+PERIODIC_TABLE = {
+    1: 'H',  2: 'He', 3: 'Li', 4: 'Be', 5: 'B',  6: 'C',  7: 'N',  8: 'O',
+    9: 'F', 10: 'Ne',11: 'Na',12: 'Mg',13: 'Al',14: 'Si',15: 'P', 16: 'S',
+   17: 'Cl',18: 'Ar',19: 'K', 20: 'Ca',21: 'Sc',22: 'Ti',23: 'V', 24: 'Cr',
+   25: 'Mn',26: 'Fe',27: 'Co',28: 'Ni',29: 'Cu',30: 'Zn',31: 'Ga',32: 'Ge',
+   33: 'As',34: 'Se',35: 'Br',36: 'Kr'
+}
+
+# Define expected DataFrame columns
 COLUMNS = [
     'molecule', 'wavelengths', 'oscillator_strengths',
-    'width', 'kind', 'spectrum'
+    'width', 'kind', 'spectrum', 'geometry'
 ]
 
+# Regex to detect atomic data lines
+ATOM_LINE = re.compile(r'^\s*(\d+)\s+(\d+)')
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Parse Gaussian log files and create broadened spectra."
-    )
-    parser.add_argument(
-        '--start', type=int, help='Start molecule index (inclusive)'
-    )
-    parser.add_argument(
-        '--end', type=int, help='End molecule index (inclusive)'
-    )
-    parser.add_argument(
-        '--width', type=float, default=10.0,
-        help='Broadening width in nm'
-    )
-    parser.add_argument(
-        '--kind', choices=['gaussian','lorentzian'], default='gaussian',
-        help='Broadening type'
-    )
-    parser.add_argument(
-        '--csv', default='spectra.csv',
-        help='Output CSV file'
-    )
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="Parse Gaussian logs, spectra, and geometries.")
+    p.add_argument('--start', type=int, help='Start molecule index')
+    p.add_argument('--end', type=int, help='End molecule index')
+    p.add_argument('--width', type=float, default=10.0, help='Spectral broadening width (nm)')
+    p.add_argument('--kind', choices=['gaussian','lorentzian'], default='gaussian', help='Broadening kernel')
+    p.add_argument('--csv', default='spectra.csv', help='Output CSV file')
+    return p.parse_args()
 
 
 def parse_excitation_data(logfile):
-    """Extract (wavelength_nm, oscillator_strength) from a Gaussian log file."""
+    """Extract (wavelength_nm, oscillator_strength) from Gaussian log."""
     pattern = re.compile(r'([0-9]+\.?[0-9]*) eV\s+([0-9]+\.?[0-9]*) nm\s+f=([0-9]+\.?[0-9]*)')
     excitations = []
-    with open(logfile, 'r') as f:
+    with open(logfile) as f:
         for line in f:
             if 'Excited State' in line:
                 m = pattern.search(line)
@@ -79,89 +66,90 @@ def parse_excitation_data(logfile):
     return excitations
 
 
-def compute_spectrum(excitations, x, width, kind):
-    """Compute broadened (normalized) spectrum for excitations over x-axis."""
+def parse_optimized_geometry(logfile):
+    """Extract last 'Standard orientation' block, convert atomic numbers to symbols."""
+    last_block = []
+    with open(logfile) as f:
+        current = None
+        for line in f:
+            if 'Standard orientation' in line:
+                current = []
+                for _ in range(4): next(f, None)
+                continue
+            if current is None:
+                continue
+            if line.strip().startswith('----'):
+                last_block = current
+                break
+            if not ATOM_LINE.match(line):
+                continue
+            parts = line.split()
+            if len(parts) < 6:
+                continue
+            atomic_num = int(parts[1])
+            symbol = PERIODIC_TABLE.get(atomic_num, 'X')
+            x, y, z = parts[3], parts[4], parts[5]
+            current.append(f"{symbol} {x} {y} {z}")
+    return '\n'.join(last_block)
+
+
+def compute_spectrum(ex, x, width, kind):
     y = np.zeros_like(x, dtype=float)
-    for lam, f in excitations:
+    for lam, f in ex:
         if kind == 'gaussian':
-            y += f * np.exp(-((x - lam)**2) / (2 * width**2))
-        else:  # lorentzian
-            y += f * (width**2 / ((x - lam)**2 + width**2))
-    # Normalize
-    if y.max() > 0:
-        y /= y.max()
+            y += f * np.exp(-((x-lam)**2)/(2*width**2))
+        else:
+            y += f * (width**2/((x-lam)**2 + width**2))
+    if y.max() > 0: y /= y.max()
     return y
 
 
 def main():
     args = parse_args()
-    
-    # Determine molecule indices
     if args.start is not None:
-        start = args.start
-        end = args.end if args.end is not None else args.start
-        mol_idxs = list(range(start, end+1))
+        idxs = range(args.start, (args.end or args.start) + 1)
     else:
-        # scan all log files matching 'molecule_####.log'
-        mol_idxs = []
-        for fn in glob.glob('molecule_*.log'):
-            m = re.match(r'molecule_(\d{4})\.log', fn)
-            if m:
-                mol_idxs.append(int(m.group(1)))
-        mol_idxs.sort()
+        idxs = sorted(int(re.match(r'molecule_(\d{4})\.log', fn).group(1)) for fn in glob.glob('molecule_*.log'))
 
-    # Load or initialize DataFrame
     if os.path.exists(args.csv):
         df = pd.read_csv(args.csv)
+        df = df.reindex(columns=COLUMNS)
         existing = set(df['molecule'].astype(int))
     else:
-        df = pd.DataFrame(columns=[
-            'molecule', 'wavelengths', 'oscillator_strengths',
-            'width', 'kind', 'spectrum'
-        ])
+        df = pd.DataFrame(columns=COLUMNS)
         existing = set()
 
-    # Prepare x-axis for spectrum 0–800 nm
     x = np.arange(0, 801, 1)
-
     records = []
-    for idx in mol_idxs:
-        if idx in existing:
-            continue
+    for idx in idxs:
+        if idx in existing: continue
         logfile = f"molecule_{idx:04d}.log"
         if not os.path.isfile(logfile):
             print(f"Warning: {logfile} not found, skipping.")
             continue
-
-        # Automatic filtering: ensure job completed by checking last 10 lines
-        with open(logfile, 'r') as f:
-            lines = f.readlines()
-        tail = ''.join(lines[-10:])
-        if 'Normal termination' not in tail:
-            print(f"Skipping {logfile}: no Normal termination in last 10 lines.")
+        lines = open(logfile).read().splitlines()
+        if 'Normal termination' not in '\n'.join(lines[-10:]):
+            print(f"Skipping {logfile}: not terminated normally.")
             continue
-
-        excitations = parse_excitation_data(logfile)
-        if not excitations:
-            print(f"No excitations found in {logfile}, skipping.")
+        ex = parse_excitation_data(logfile)
+        if not ex:
+            print(f"No excitations in {logfile}, skipping.")
             continue
-
-        wavelengths = [e[0] for e in excitations]
-        strengths = [e[1] for e in excitations]
-        spectrum = compute_spectrum(excitations, x, args.width, args.kind)
-
-        records.append({
-            'molecule': idx,
-            'wavelengths': json.dumps(wavelengths),
-            'oscillator_strengths': json.dumps(strengths),
-            'width': args.width,
-            'kind': args.kind,
-            'spectrum': json.dumps(spectrum.tolist())
-        })
-
+        geom = parse_optimized_geometry(logfile)
+        lam = [e[0] for e in ex]
+        strg = [e[1] for e in ex]
+        spec = compute_spectrum(ex, x, args.width, args.kind)
+        records.append({'molecule': idx,
+                        'wavelengths': json.dumps(lam),
+                        'oscillator_strengths': json.dumps(strg),
+                        'width': args.width,
+                        'kind': args.kind,
+                        'spectrum': json.dumps(spec.tolist()),
+                        'geometry': geom})
     if records:
-        df_new = pd.DataFrame(records, columns=COLUMNS)
-        df = pd.concat([df, df_new], ignore_index=True)
+        df2 = pd.DataFrame(records, columns=COLUMNS)
+        # perform concat and then reindex to ensure consistent columns
+        df = pd.concat([df, df2], ignore_index=True, sort=False)
         df = df.reindex(columns=COLUMNS)
         df.sort_values('molecule', inplace=True)
         df.to_csv(args.csv, index=False)
@@ -169,6 +157,6 @@ def main():
     else:
         print("No new records to append.")
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
+
